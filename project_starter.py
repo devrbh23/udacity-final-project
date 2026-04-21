@@ -590,30 +590,449 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 
 # Set up and load your env parameters and instantiate your model.
-
+import json
+from openai import OpenAI
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
+dotenv.load_dotenv()
+api_key = os.getenv("UDACITY_OPENAI_API_KEY") 
+base_url =  "https://openai.vocareum.com/v1"
+ 
+client = OpenAI(api_key=api_key, base_url=base_url)
+MODEL = "gpt-4o-mini"
+
+def run_agent(system_prompt: str, user_message: str, tools: list, tool_map: dict, max_turns: int = 6) -> str:
+    """
+    Run a single agent loop: send messages, execute tool calls, loop until
+    the model produces a final text response (no more tool calls).
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_message},
+    ]
+ 
+    for _ in range(max_turns):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None,
+        )
+        msg = response.choices[0].message
+ 
+        # No tool calls → final answer
+        if not msg.tool_calls:
+            return msg.content or ""
+ 
+        # Append assistant message (with tool_calls)
+        messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in msg.tool_calls
+        ]})
+ 
+        # Execute each tool call and append results
+        for tc in msg.tool_calls:
+            fn_name = tc.function.name
+            fn_args = json.loads(tc.function.arguments)
+            fn = tool_map.get(fn_name)
+            if fn:
+                try:
+                    result = fn(**fn_args)
+                except Exception as e:
+                    result = f"ERROR: {e}"
+            else:
+                result = f"Unknown tool: {fn_name}"
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": str(result),
+            })
+ 
+    return "Agent reached max turns without a final answer."
+
+
 
 # Tools for inventory agent
-
+INVENTORY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_inventory",
+            "description": "Get the current stock level of a specific item as of a given date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {"type": "string", "description": "Exact item name from the catalogue."},
+                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+                },
+                "required": ["item_name", "as_of_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_full_inventory",
+            "description": "Get all items currently in stock with their quantities as of a given date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+                },
+                "required": ["as_of_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restock_item",
+            "description": (
+                "Order stock from the supplier for an item that is low or out of stock. "
+                "Records a stock_orders transaction and returns the delivery date."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name":  {"type": "string",  "description": "Exact item name."},
+                    "quantity":   {"type": "integer", "description": "Number of units to order."},
+                    "date":       {"type": "string",  "description": "Order date YYYY-MM-DD."},
+                },
+                "required": ["item_name", "quantity", "date"],
+            },
+        },
+    },
+]
 
 # Tools for quoting agent
-
+QUOTE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_past_quotes",
+            "description": "Search historical quotes for similar requests to use as pricing reference.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_terms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Keywords to search for (item names, event type, job type).",
+                    },
+                    "limit": {"type": "integer", "description": "Max results to return (default 5)."},
+                },
+                "required": ["search_terms"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_item_price",
+            "description": "Get the unit price for a specific paper supply item.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {"type": "string", "description": "Exact item name from catalogue."},
+                },
+                "required": ["item_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_catalogue",
+            "description": "Get the full product catalogue with names, categories and unit prices.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
 
 # Tools for ordering agent
-
+ORDER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "process_sale",
+            "description": (
+                "Record a confirmed sale transaction for a single item. "
+                "Deducts stock and adds revenue. Call once per line item."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name":  {"type": "string",  "description": "Exact item name."},
+                    "quantity":   {"type": "integer", "description": "Units sold."},
+                    "unit_price": {"type": "number",  "description": "Price per unit after any discount."},
+                    "date":       {"type": "string",  "description": "Sale date YYYY-MM-DD."},
+                },
+                "required": ["item_name", "quantity", "unit_price", "date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_cash_balance_tool",
+            "description": "Get the current available cash balance as of a given date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+                },
+                "required": ["as_of_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_supplier_lead_time",
+            "description": "Get the estimated delivery date from a supplier given an order date and quantity.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_date": {"type": "string",  "description": "Order date YYYY-MM-DD."},
+                    "quantity":   {"type": "integer", "description": "Number of units ordered."},
+                },
+                "required": ["order_date", "quantity"],
+            },
+        },
+    },
+]
 
 # Set up your agents and create an orchestration agent that will manage them.
+_price_lookup: Dict[str, float] = {item["item_name"]: item["unit_price"] for item in paper_supplies}
+ 
+def _check_inventory(item_name: str, as_of_date: str) -> str:
+    df = get_stock_level(item_name, as_of_date)
+    stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
+    return json.dumps({"item_name": item_name, "stock": stock, "as_of_date": as_of_date})
+ 
+def _get_full_inventory(as_of_date: str) -> str:
+    inv = get_all_inventory(as_of_date)
+    return json.dumps(inv)
+ 
+def _restock_item(item_name: str, quantity: int, date: str) -> str:
+    unit_price = _price_lookup.get(item_name, 0.10)
+    total_cost = quantity * unit_price
+    cash = get_cash_balance(date)
+    if total_cost > cash:
+        # Order what we can afford
+        affordable_qty = int(cash // unit_price)
+        if affordable_qty <= 0:
+            return json.dumps({"status": "failed", "reason": "Insufficient cash", "cash_available": cash})
+        quantity = affordable_qty
+        total_cost = quantity * unit_price
+ 
+    tx_id = create_transaction(item_name, "stock_orders", quantity, total_cost, date)
+    delivery_date = get_supplier_delivery_date(date, quantity)
+    return json.dumps({
+        "status": "ordered",
+        "item_name": item_name,
+        "quantity": quantity,
+        "total_cost": round(total_cost, 2),
+        "delivery_date": delivery_date,
+        "transaction_id": tx_id,
+    })
+ 
+def _lookup_past_quotes(search_terms: List[str], limit: int = 5) -> str:
+    results = search_quote_history(search_terms, limit=limit)
+    return json.dumps(results)
+ 
+def _get_item_price(item_name: str) -> str:
+    price = _price_lookup.get(item_name)
+    if price is None:
+        # fuzzy: find closest match
+        matches = [(k, v) for k, v in _price_lookup.items() if item_name.lower() in k.lower()]
+        if matches:
+            return json.dumps({"item_name": matches[0][0], "unit_price": matches[0][1], "note": "fuzzy match"})
+        return json.dumps({"error": f"Item '{item_name}' not found in catalogue"})
+    return json.dumps({"item_name": item_name, "unit_price": price})
+ 
+def _get_catalogue() -> str:
+    return json.dumps(paper_supplies)
+ 
+def _process_sale(item_name: str, quantity: int, unit_price: float, date: str) -> str:
+    # Verify stock
+    df = get_stock_level(item_name, date)
+    stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
+    if stock < quantity:
+        return json.dumps({"status": "failed", "reason": f"Insufficient stock ({stock} available, {quantity} requested)"})
+    total_price = round(quantity * unit_price, 2)
+    tx_id = create_transaction(item_name, "sales", quantity, total_price, date)
+    return json.dumps({"status": "sold", "item_name": item_name, "quantity": quantity, "total_price": total_price, "transaction_id": tx_id})
+ 
+def _get_cash_balance_tool(as_of_date: str) -> str:
+    balance = get_cash_balance(as_of_date)
+    return json.dumps({"cash_balance": round(balance, 2), "as_of_date": as_of_date})
+ 
+def _get_supplier_lead_time(order_date: str, quantity: int) -> str:
+    delivery = get_supplier_delivery_date(order_date, quantity)
+    return json.dumps({"order_date": order_date, "quantity": quantity, "estimated_delivery": delivery})
 
+
+INVENTORY_TOOL_MAP = {
+    "check_inventory":  _check_inventory,
+    "get_full_inventory": _get_full_inventory,
+    "restock_item":     _restock_item,
+}
+ 
+QUOTE_TOOL_MAP = {
+    "lookup_past_quotes": _lookup_past_quotes,
+    "get_item_price":     _get_item_price,
+    "get_catalogue":      _get_catalogue,
+}
+ 
+ORDER_TOOL_MAP = {
+    "process_sale":          _process_sale,
+    "get_cash_balance_tool": _get_cash_balance_tool,
+    "get_supplier_lead_time": _get_supplier_lead_time,
+}
+
+INVENTORY_SYSTEM_PROMPT = """You are the Inventory Agent for Munder Difflin Paper Company.
+ 
+Your responsibilities:
+1. Check current stock levels for items mentioned in the customer request.
+2. If any requested item has stock below the requested quantity OR below 100 units, proactively restock it.
+3. For restocking: order at least 500 units (or the shortage amount, whichever is larger), but never exceed available cash.
+4. Always use exact item names from the catalogue.
+5. Return a concise JSON summary with:
+   - items_checked: list of {item_name, current_stock}
+   - restocked: list of {item_name, quantity_ordered, delivery_date} (empty if none)
+   - inventory_status: "sufficient" | "restocked" | "insufficient"
+"""
+ 
+QUOTE_SYSTEM_PROMPT = """You are the Quote Agent for Munder Difflin Paper Company.
+ 
+Your responsibilities:
+1. Search past quotes for similar requests to calibrate pricing.
+2. Look up unit prices from the catalogue for all requested items.
+3. Calculate the total price applying bulk discounts:
+   - Orders over $500: 5% discount
+   - Orders over $1000: 10% discount
+   - Orders over $5000: 15% discount
+4. Only quote items that exist in our catalogue. Map customer descriptions to the closest catalogue item.
+5. Return a structured JSON quote with:
+   - line_items: list of {item_name, quantity, unit_price, discounted_price, subtotal}
+   - discount_rate: (e.g. 0.10 for 10%)
+   - total_amount: final total after discount
+   - quote_explanation: friendly 2–3 sentence explanation for the customer
+"""
+ 
+ORDER_SYSTEM_PROMPT = """You are the Order Fulfillment Agent for Munder Difflin Paper Company.
+ 
+Your responsibilities:
+1. Check available cash before processing.
+2. Process each line item from the approved quote as a sale transaction (one call per item).
+3. Only process items that are in stock (skip and note any that are not).
+4. Return a JSON summary with:
+   - transactions: list of {item_name, quantity, total_price, transaction_id, status}
+   - total_revenue: sum of all successful sales
+   - failed_items: any items that could not be fulfilled
+   - fulfillment_status: "complete" | "partial" | "failed"
+"""
+ 
+ORCHESTRATOR_SYSTEM_PROMPT = """You are the Orchestrator for Munder Difflin Paper Company's multi-agent system.
+ 
+You coordinate three specialist agents in sequence to handle every customer request:
+  1. inventory_agent  — checks stock and restocks if needed
+  2. quote_agent      — generates a detailed, discount-aware quote
+  3. order_agent      — processes the confirmed sale transactions
+ 
+Your job:
+- Read the customer request carefully.
+- Call each sub-agent in order, passing relevant context forward.
+- Synthesise their outputs into a single, friendly customer-facing response that includes:
+  * A clear quote with itemised prices and any discount applied
+  * Delivery expectations
+  * Total amount charged
+- Keep the tone professional but warm.
+- If something cannot be fulfilled, explain why clearly.
+ 
+Always respond in plain English (not JSON) to the customer.
+"""
+
+def inventory_agent(request: str, date: str) -> str:
+    """Check and replenish stock for items in the request."""
+    prompt = f"Customer request (date: {date}):\n{request}\n\nCheck stock for all items mentioned and restock if needed."
+    return run_agent(INVENTORY_SYSTEM_PROMPT, prompt, INVENTORY_TOOLS, INVENTORY_TOOL_MAP)
+ 
+def quote_agent(request: str, date: str, inventory_summary: str) -> str:
+    """Generate a priced quote for the customer request."""
+    prompt = (
+        f"Customer request (date: {date}):\n{request}\n\n"
+        f"Inventory status from Inventory Agent:\n{inventory_summary}\n\n"
+        "Generate a full itemised quote with bulk discounts applied."
+    )
+    return run_agent(QUOTE_SYSTEM_PROMPT, prompt, QUOTE_TOOLS, QUOTE_TOOL_MAP)
+ 
+def order_agent(request: str, date: str, quote_summary: str) -> str:
+    """Process the sale transactions from the approved quote."""
+    prompt = (
+        f"Customer request (date: {date}):\n{request}\n\n"
+        f"Approved quote from Quote Agent:\n{quote_summary}\n\n"
+        "Process all line items as sale transactions."
+    )
+    return run_agent(ORDER_SYSTEM_PROMPT, prompt, ORDER_TOOLS, ORDER_TOOL_MAP)
+ 
+# ===========================================================================
+# ORCHESTRATOR  — main entry point
+# ===========================================================================
+ 
+def call_your_multi_agent_system(request: str) -> str:
+    """
+    Orchestrate the full pipeline for one customer request.
+    Returns a customer-facing response string.
+    """
+    # Extract date from request string (format injected by run_test_scenarios)
+    date = datetime.now().strftime("%Y-%m-%d")
+    if "Date of request:" in request:
+        try:
+            date = request.split("Date of request:")[-1].strip().rstrip(")")
+        except Exception:
+            pass
+ 
+    print(f"  [Orchestrator] Running pipeline for date={date}")
+ 
+    # Step 1: Inventory
+    print("  [Inventory Agent] Checking & restocking...")
+    inv_result = inventory_agent(request, date)
+    print(f"  [Inventory Agent] {inv_result[:120]}...")
+ 
+    # Step 2: Quote
+    print("  [Quote Agent] Generating quote...")
+    quote_result = quote_agent(request, date, inv_result)
+    print(f"  [Quote Agent] {quote_result[:120]}...")
+ 
+    # Step 3: Order
+    print("  [Order Agent] Processing transactions...")
+    order_result = order_agent(request, date, quote_result)
+    print(f"  [Order Agent] {order_result[:120]}...")
+ 
+    # Step 4: Orchestrator synthesises final response
+    synthesis_prompt = (
+        f"Original customer request:\n{request}\n\n"
+        f"Inventory Agent result:\n{inv_result}\n\n"
+        f"Quote Agent result:\n{quote_result}\n\n"
+        f"Order Agent result:\n{order_result}\n\n"
+        "Write a professional, friendly customer-facing response summarising the order, quote, and delivery."
+    )
+    final_response = run_agent(ORCHESTRATOR_SYSTEM_PROMPT, synthesis_prompt, [], {})
+    return final_response
+ 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
+
+
 
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -630,6 +1049,9 @@ def run_test_scenarios():
     report = generate_financial_report(initial_date)
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
+
+    print("Multi-agent system ready (Orchestrator + Inventory + Quote + Order agents).")
+
 
     ############
     ############
@@ -660,8 +1082,8 @@ def run_test_scenarios():
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
-
+        response = call_your_multi_agent_system(request_with_date)
+        
         # Update state
         report = generate_financial_report(request_date)
         current_cash = report["cash_balance"]
