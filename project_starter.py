@@ -588,446 +588,436 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 ########################
 
-
-# Set up and load your env parameters and instantiate your model.
 import json
-from openai import OpenAI
+from smolagents import Tool, ToolCallingAgent, OpenAIServerModel, EMPTY_PROMPT_TEMPLATES
 
-"""Set up tools for your agents to use, these should be methods that combine the database functions above
- and apply criteria to them to ensure that the flow of the system is correct."""
-
+# ---------------------------------------------------------------------------
+# Load environment and instantiate the smolagents model
+# ---------------------------------------------------------------------------
 dotenv.load_dotenv()
-api_key = os.getenv("UDACITY_OPENAI_API_KEY") 
-base_url =  "https://openai.vocareum.com/v1"
+api_key  = os.getenv("UDACITY_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+base_url = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
+
+llm_model = OpenAIServerModel(
+    model_id="gpt-4o-mini",
+    api_base=base_url,
+    api_key=api_key,
+)
  
-client = OpenAI(api_key=api_key, base_url=base_url)
-MODEL = "gpt-4o-mini"
-
-def run_agent(system_prompt: str, user_message: str, tools: list, tool_map: dict, max_turns: int = 6) -> str:
-    """
-    Run a single agent loop: send messages, execute tool calls, loop until
-    the model produces a final text response (no more tool calls).
-    """
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_message},
-    ]
+# ===========================================================================
+# TOOL IMPLEMENTATIONS
+# Wrapped as smolagents Tool subclasses so agents can discover and call them.
+# ===========================================================================
  
-    for _ in range(max_turns):
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools if tools else None,
-            tool_choice="auto" if tools else None,
-        )
-        msg = response.choices[0].message
- 
-        # No tool calls → final answer
-        if not msg.tool_calls:
-            return msg.content or ""
- 
-        # Append assistant message (with tool_calls)
-        messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]})
- 
-        # Execute each tool call and append results
-        for tc in msg.tool_calls:
-            fn_name = tc.function.name
-            fn_args = json.loads(tc.function.arguments)
-            fn = tool_map.get(fn_name)
-            if fn:
-                try:
-                    result = fn(**fn_args)
-                except Exception as e:
-                    result = f"ERROR: {e}"
-            else:
-                result = f"Unknown tool: {fn_name}"
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": str(result),
-            })
- 
-    return "Agent reached max turns without a final answer."
-
-
-
-# Tools for inventory agent
-INVENTORY_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "check_inventory",
-            "description": "Get the current stock level of a specific item as of a given date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string", "description": "Exact item name from the catalogue."},
-                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
-                },
-                "required": ["item_name", "as_of_date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_full_inventory",
-            "description": "Get all items currently in stock with their quantities as of a given date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
-                },
-                "required": ["as_of_date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "restock_item",
-            "description": (
-                "Order stock from the supplier for an item that is low or out of stock. "
-                "Records a stock_orders transaction and returns the delivery date."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name":  {"type": "string",  "description": "Exact item name."},
-                    "quantity":   {"type": "integer", "description": "Number of units to order."},
-                    "date":       {"type": "string",  "description": "Order date YYYY-MM-DD."},
-                },
-                "required": ["item_name", "quantity", "date"],
-            },
-        },
-    },
-]
-
-# Tools for quoting agent
-QUOTE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_past_quotes",
-            "description": "Search historical quotes for similar requests to use as pricing reference.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "search_terms": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Keywords to search for (item names, event type, job type).",
-                    },
-                    "limit": {"type": "integer", "description": "Max results to return (default 5)."},
-                },
-                "required": ["search_terms"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_item_price",
-            "description": "Get the unit price for a specific paper supply item.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string", "description": "Exact item name from catalogue."},
-                },
-                "required": ["item_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_catalogue",
-            "description": "Get the full product catalogue with names, categories and unit prices.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-]
-
-# Tools for ordering agent
-ORDER_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "process_sale",
-            "description": (
-                "Record a confirmed sale transaction for a single item. "
-                "Deducts stock and adds revenue. Call once per line item."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name":  {"type": "string",  "description": "Exact item name."},
-                    "quantity":   {"type": "integer", "description": "Units sold."},
-                    "unit_price": {"type": "number",  "description": "Price per unit after any discount."},
-                    "date":       {"type": "string",  "description": "Sale date YYYY-MM-DD."},
-                },
-                "required": ["item_name", "quantity", "unit_price", "date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_cash_balance_tool",
-            "description": "Get the current available cash balance as of a given date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
-                },
-                "required": ["as_of_date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_supplier_lead_time",
-            "description": "Get the estimated delivery date from a supplier given an order date and quantity.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "order_date": {"type": "string",  "description": "Order date YYYY-MM-DD."},
-                    "quantity":   {"type": "integer", "description": "Number of units ordered."},
-                },
-                "required": ["order_date", "quantity"],
-            },
-        },
-    },
-]
-
-# Set up your agents and create an orchestration agent that will manage them.
+# --- Price lookup dict (built from catalogue at import time) ---------------
 _price_lookup: Dict[str, float] = {item["item_name"]: item["unit_price"] for item in paper_supplies}
  
-def _check_inventory(item_name: str, as_of_date: str) -> str:
-    df = get_stock_level(item_name, as_of_date)
-    stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
-    return json.dumps({"item_name": item_name, "stock": stock, "as_of_date": as_of_date})
  
-def _get_full_inventory(as_of_date: str) -> str:
-    inv = get_all_inventory(as_of_date)
-    return json.dumps(inv)
+def _parse_date(request: str) -> str:
+    """Utility: extract YYYY-MM-DD date from a request string."""
+    if "Date of request:" in request:
+        try:
+            return request.split("Date of request:")[-1].strip().rstrip(")")
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y-%m-%d")
  
-def _restock_item(item_name: str, quantity: int, date: str) -> str:
-    unit_price = _price_lookup.get(item_name, 0.10)
-    total_cost = quantity * unit_price
-    cash = get_cash_balance(date)
-    if total_cost > cash:
-        # Order what we can afford
-        affordable_qty = int(cash // unit_price)
-        if affordable_qty <= 0:
-            return json.dumps({"status": "failed", "reason": "Insufficient cash", "cash_available": cash})
-        quantity = affordable_qty
+ 
+# ---------------------------------------------------------------------------
+# Inventory Tools
+# ---------------------------------------------------------------------------
+ 
+class CheckInventoryTool(Tool):
+    """smolagents tool: get current stock level for one item."""
+    name        = "check_inventory"
+    description = (
+        "Get the current stock level of a specific paper supply item as of a given date. "
+        "Returns JSON with item_name, stock quantity, and as_of_date."
+    )
+    inputs      = {
+        "item_name":   {"type": "string", "description": "Exact item name from the catalogue."},
+        "as_of_date":  {"type": "string", "description": "Date in YYYY-MM-DD format."},
+    }
+    output_type = "string"
+ 
+    def forward(self, item_name: str, as_of_date: str) -> str:
+        """Return the current stock level for item_name as of as_of_date."""
+        df    = get_stock_level(item_name, as_of_date)
+        stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
+        return json.dumps({"item_name": item_name, "stock": stock, "as_of_date": as_of_date})
+ 
+ 
+class GetFullInventoryTool(Tool):
+    """smolagents tool: get all items currently in stock."""
+    name        = "get_full_inventory"
+    description = (
+        "Get all paper supply items currently in stock with their quantities as of a given date. "
+        "Returns a JSON dict of {item_name: quantity}."
+    )
+    inputs      = {
+        "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+    }
+    output_type = "string"
+ 
+    def forward(self, as_of_date: str) -> str:
+        """Return a snapshot of all in-stock items and their quantities."""
+        inv = get_all_inventory(as_of_date)
+        return json.dumps(inv)
+ 
+ 
+class RestockItemTool(Tool):
+    """smolagents tool: order new stock from supplier for a low or out-of-stock item."""
+    name        = "restock_item"
+    description = (
+        "Order stock from the supplier for an item that is low or out of stock. "
+        "Records a stock_orders transaction and returns the estimated delivery date. "
+        "Cash-aware: automatically reduces quantity if cash is insufficient."
+    )
+    inputs      = {
+        "item_name": {"type": "string",  "description": "Exact item name from the catalogue."},
+        "quantity":  {"type": "integer", "description": "Number of units to order (min 500 recommended)."},
+        "date":      {"type": "string",  "description": "Order date in YYYY-MM-DD format."},
+    }
+    output_type = "string"
+ 
+    def forward(self, item_name: str, quantity: int, date: str) -> str:
+        """Place a supplier restock order and record the transaction."""
+        unit_price = _price_lookup.get(item_name, 0.10)
         total_cost = quantity * unit_price
+        cash       = get_cash_balance(date)
+        if total_cost > cash:
+            quantity   = int(cash // unit_price)
+            total_cost = quantity * unit_price
+            if quantity <= 0:
+                return json.dumps({"status": "failed", "reason": "Insufficient cash", "cash_available": cash})
+        tx_id         = create_transaction(item_name, "stock_orders", quantity, total_cost, date)
+        delivery_date = get_supplier_delivery_date(date, quantity)
+        return json.dumps({
+            "status": "ordered",
+            "item_name": item_name,
+            "quantity": quantity,
+            "total_cost": round(total_cost, 2),
+            "delivery_date": delivery_date,
+            "transaction_id": tx_id,
+        })
  
-    tx_id = create_transaction(item_name, "stock_orders", quantity, total_cost, date)
-    delivery_date = get_supplier_delivery_date(date, quantity)
-    return json.dumps({
-        "status": "ordered",
-        "item_name": item_name,
-        "quantity": quantity,
-        "total_cost": round(total_cost, 2),
-        "delivery_date": delivery_date,
-        "transaction_id": tx_id,
-    })
  
-def _lookup_past_quotes(search_terms: List[str], limit: int = 5) -> str:
-    results = search_quote_history(search_terms, limit=limit)
-    return json.dumps(results)
+# ---------------------------------------------------------------------------
+# Quote Tools
+# ---------------------------------------------------------------------------
  
-def _get_item_price(item_name: str) -> str:
-    price = _price_lookup.get(item_name)
-    if price is None:
-        # fuzzy: find closest match
-        matches = [(k, v) for k, v in _price_lookup.items() if item_name.lower() in k.lower()]
-        if matches:
-            return json.dumps({"item_name": matches[0][0], "unit_price": matches[0][1], "note": "fuzzy match"})
-        return json.dumps({"error": f"Item '{item_name}' not found in catalogue"})
-    return json.dumps({"item_name": item_name, "unit_price": price})
+class LookupPastQuotesTool(Tool):
+    """smolagents tool: search historical quotes for pricing context."""
+    name        = "lookup_past_quotes"
+    description = (
+        "Search historical quotes for similar requests to use as a pricing reference. "
+        "Returns a list of relevant past quotes matching the given keywords."
+    )
+    inputs      = {
+        "search_terms": {"type": "string", "description": "Comma-separated keywords (item names, event type)."},
+        "limit":        {"type": "integer", "description": "Max number of results to return (default 5).", "nullable": True},
+    }
+    output_type = "string"
  
-def _get_catalogue() -> str:
-    return json.dumps(paper_supplies)
+    def forward(self, search_terms: str, limit: int = 5) -> str:
+        """Return past quotes that match the search terms."""
+        terms   = [t.strip() for t in search_terms.split(",") if t.strip()]
+        results = search_quote_history(terms, limit=limit)
+        return json.dumps(results)
  
-def _process_sale(item_name: str, quantity: int, unit_price: float, date: str) -> str:
-    # Verify stock
-    df = get_stock_level(item_name, date)
-    stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
-    if stock < quantity:
-        return json.dumps({"status": "failed", "reason": f"Insufficient stock ({stock} available, {quantity} requested)"})
-    total_price = round(quantity * unit_price, 2)
-    tx_id = create_transaction(item_name, "sales", quantity, total_price, date)
-    return json.dumps({"status": "sold", "item_name": item_name, "quantity": quantity, "total_price": total_price, "transaction_id": tx_id})
  
-def _get_cash_balance_tool(as_of_date: str) -> str:
-    balance = get_cash_balance(as_of_date)
-    return json.dumps({"cash_balance": round(balance, 2), "as_of_date": as_of_date})
+class GetItemPriceTool(Tool):
+    """smolagents tool: look up unit price for a catalogue item (with fuzzy matching)."""
+    name        = "get_item_price"
+    description = (
+        "Get the unit price for a specific paper supply item. "
+        "Supports fuzzy matching if the exact name is unknown. "
+        "Returns JSON with item_name and unit_price."
+    )
+    inputs      = {
+        "item_name": {"type": "string", "description": "Item name (exact or approximate)."},
+    }
+    output_type = "string"
  
-def _get_supplier_lead_time(order_date: str, quantity: int) -> str:
-    delivery = get_supplier_delivery_date(order_date, quantity)
-    return json.dumps({"order_date": order_date, "quantity": quantity, "estimated_delivery": delivery})
-
-
-INVENTORY_TOOL_MAP = {
-    "check_inventory":  _check_inventory,
-    "get_full_inventory": _get_full_inventory,
-    "restock_item":     _restock_item,
-}
+    def forward(self, item_name: str) -> str:
+        """Return the unit price for item_name, with fuzzy fallback."""
+        price = _price_lookup.get(item_name)
+        if price is None:
+            matches = [(k, v) for k, v in _price_lookup.items() if item_name.lower() in k.lower()]
+            if matches:
+                return json.dumps({"item_name": matches[0][0], "unit_price": matches[0][1], "note": "fuzzy match"})
+            return json.dumps({"error": f"Item '{item_name}' not found in catalogue"})
+        return json.dumps({"item_name": item_name, "unit_price": price})
  
-QUOTE_TOOL_MAP = {
-    "lookup_past_quotes": _lookup_past_quotes,
-    "get_item_price":     _get_item_price,
-    "get_catalogue":      _get_catalogue,
-}
  
-ORDER_TOOL_MAP = {
-    "process_sale":          _process_sale,
-    "get_cash_balance_tool": _get_cash_balance_tool,
-    "get_supplier_lead_time": _get_supplier_lead_time,
-}
-
-INVENTORY_SYSTEM_PROMPT = """You are the Inventory Agent for Munder Difflin Paper Company.
+class GetCatalogueTool(Tool):
+    """smolagents tool: retrieve the full product catalogue."""
+    name        = "get_catalogue"
+    description = (
+        "Get the full product catalogue with all available paper supply item names, "
+        "categories, and unit prices. Use this to discover what items are available."
+    )
+    inputs      = {}
+    output_type = "string"
  
-Your responsibilities:
-1. Check current stock levels for items mentioned in the customer request.
-2. If any requested item has stock below the requested quantity OR below 100 units, proactively restock it.
-3. For restocking: order at least 500 units (or the shortage amount, whichever is larger), but never exceed available cash.
-4. Always use exact item names from the catalogue.
-5. Return a concise JSON summary with:
-   - items_checked: list of {item_name, current_stock}
-   - restocked: list of {item_name, quantity_ordered, delivery_date} (empty if none)
-   - inventory_status: "sufficient" | "restocked" | "insufficient"
-"""
+    def forward(self) -> str:
+        """Return the complete product catalogue as JSON."""
+        return json.dumps(paper_supplies)
  
-QUOTE_SYSTEM_PROMPT = """You are the Quote Agent for Munder Difflin Paper Company.
  
-Your responsibilities:
-1. Search past quotes for similar requests to calibrate pricing.
-2. Look up unit prices from the catalogue for all requested items.
-3. Calculate the total price applying bulk discounts:
-   - Orders over $500: 5% discount
-   - Orders over $1000: 10% discount
-   - Orders over $5000: 15% discount
-4. Only quote items that exist in our catalogue. Map customer descriptions to the closest catalogue item.
-5. Return a structured JSON quote with:
-   - line_items: list of {item_name, quantity, unit_price, discounted_price, subtotal}
-   - discount_rate: (e.g. 0.10 for 10%)
-   - total_amount: final total after discount
-   - quote_explanation: friendly 2–3 sentence explanation for the customer
-"""
+# ---------------------------------------------------------------------------
+# Order Tools
+# ---------------------------------------------------------------------------
  
-ORDER_SYSTEM_PROMPT = """You are the Order Fulfillment Agent for Munder Difflin Paper Company.
+class ProcessSaleTool(Tool):
+    """smolagents tool: record a confirmed sale transaction for one line item."""
+    name        = "process_sale"
+    description = (
+        "Record a confirmed sale transaction for a single item. "
+        "Deducts stock and adds revenue. Call once per line item in the quote. "
+        "Returns JSON with transaction status and ID."
+    )
+    inputs      = {
+        "item_name":  {"type": "string",  "description": "Exact item name from the catalogue."},
+        "quantity":   {"type": "integer", "description": "Number of units sold."},
+        "unit_price": {"type": "number",  "description": "Price per unit after any discount."},
+        "date":       {"type": "string",  "description": "Sale date in YYYY-MM-DD format."},
+    }
+    output_type = "string"
  
-Your responsibilities:
-1. Check available cash before processing.
-2. Process each line item from the approved quote as a sale transaction (one call per item).
-3. Only process items that are in stock (skip and note any that are not).
-4. Return a JSON summary with:
-   - transactions: list of {item_name, quantity, total_price, transaction_id, status}
-   - total_revenue: sum of all successful sales
-   - failed_items: any items that could not be fulfilled
-   - fulfillment_status: "complete" | "partial" | "failed"
-"""
+    def forward(self, item_name: str, quantity: int, unit_price: float, date: str) -> str:
+        """Execute a sale transaction, verifying stock before committing."""
+        df    = get_stock_level(item_name, date)
+        stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
+        if stock < quantity:
+            return json.dumps({
+                "status": "failed",
+                "reason": f"Insufficient stock ({stock} available, {quantity} requested)"
+            })
+        total_price = round(quantity * unit_price, 2)
+        tx_id       = create_transaction(item_name, "sales", quantity, total_price, date)
+        return json.dumps({
+            "status": "sold",
+            "item_name": item_name,
+            "quantity": quantity,
+            "total_price": total_price,
+            "transaction_id": tx_id,
+        })
  
-ORCHESTRATOR_SYSTEM_PROMPT = """You are the Orchestrator for Munder Difflin Paper Company's multi-agent system.
  
-You coordinate three specialist agents in sequence to handle every customer request:
-  1. inventory_agent  — checks stock and restocks if needed
-  2. quote_agent      — generates a detailed, discount-aware quote
-  3. order_agent      — processes the confirmed sale transactions
+class GetCashBalanceTool(Tool):
+    """smolagents tool: get the current cash balance."""
+    name        = "get_cash_balance_tool"
+    description = (
+        "Get the current available cash balance as of a given date. "
+        "Use before processing orders to confirm sufficient funds."
+    )
+    inputs      = {
+        "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+    }
+    output_type = "string"
  
-Your job:
-- Read the customer request carefully.
-- Call each sub-agent in order, passing relevant context forward.
-- Synthesise their outputs into a single, friendly customer-facing response that includes:
-  * A clear quote with itemised prices and any discount applied
-  * Delivery expectations
-  * Total amount charged
-- Keep the tone professional but warm.
-- If something cannot be fulfilled, explain why clearly.
+    def forward(self, as_of_date: str) -> str:
+        """Return the cash balance as of the given date."""
+        balance = get_cash_balance(as_of_date)
+        return json.dumps({"cash_balance": round(balance, 2), "as_of_date": as_of_date})
  
-Always respond in plain English (not JSON) to the customer.
-"""
-
+ 
+class GetSupplierLeadTimeTool(Tool):
+    """smolagents tool: estimate supplier delivery date."""
+    name        = "get_supplier_lead_time"
+    description = (
+        "Get the estimated delivery date from the supplier given an order date and quantity. "
+        "Larger orders take longer. Returns JSON with order_date and estimated_delivery."
+    )
+    inputs      = {
+        "order_date": {"type": "string",  "description": "Order date in YYYY-MM-DD format."},
+        "quantity":   {"type": "integer", "description": "Number of units ordered."},
+    }
+    output_type = "string"
+ 
+    def forward(self, order_date: str, quantity: int) -> str:
+        """Return the estimated delivery date for a supplier order."""
+        delivery = get_supplier_delivery_date(order_date, quantity)
+        return json.dumps({"order_date": order_date, "quantity": quantity, "estimated_delivery": delivery})
+ 
+ 
+# ===========================================================================
+# INSTANTIATE TOOL OBJECTS
+# ===========================================================================
+inventory_tools = [CheckInventoryTool(), GetFullInventoryTool(), RestockItemTool()]
+quote_tools     = [LookupPastQuotesTool(), GetItemPriceTool(), GetCatalogueTool()]
+order_tools     = [ProcessSaleTool(), GetCashBalanceTool(), GetSupplierLeadTimeTool()]
+ 
+ 
+# ===========================================================================
+# WORKER AGENTS  (smolagents ToolCallingAgent)
+# ===========================================================================
+ 
+INVENTORY_SYSTEM_PROMPT = (
+    "You are the Inventory Agent for Munder Difflin Paper Company. "
+    "Check stock for every item in the customer request. "
+    "If any item has fewer than 100 units OR less than the requested quantity, restock it "
+    "(order at least 500 units, respecting available cash). "
+    "Return a JSON summary: {items_checked, restocked, inventory_status}."
+)
+ 
+QUOTE_SYSTEM_PROMPT = (
+    "You are the Quote Agent for Munder Difflin Paper Company. "
+    "Search past quotes for context, look up unit prices, and produce an itemised quote. "
+    "Apply bulk discounts: >$500 → 5%, >$1000 → 10%, >$5000 → 15%. "
+    "Return JSON: {line_items, discount_rate, total_amount, quote_explanation}."
+)
+ 
+ORDER_SYSTEM_PROMPT = (
+    "You are the Order Fulfillment Agent for Munder Difflin Paper Company. "
+    "Verify cash availability, then process each line item as a sale transaction (one call per item). "
+    "Skip items with insufficient stock and report them clearly. "
+    "Return JSON: {transactions, total_revenue, failed_items, fulfillment_status}."
+)
+ 
+ 
 def inventory_agent(request: str, date: str) -> str:
-    """Check and replenish stock for items in the request."""
-    prompt = f"Customer request (date: {date}):\n{request}\n\nCheck stock for all items mentioned and restock if needed."
-    return run_agent(INVENTORY_SYSTEM_PROMPT, prompt, INVENTORY_TOOLS, INVENTORY_TOOL_MAP)
+    """
+    Worker agent: check and replenish stock for all items in the request.
+ 
+    Args:
+        request: The raw customer request text.
+        date:    The request date in YYYY-MM-DD format.
+ 
+    Returns:
+        JSON string summarising items checked and any restock orders placed.
+    """
+    agent  = ToolCallingAgent(
+        tools=inventory_tools,
+        model=llm_model,
+        max_steps=8,
+        verbosity_level=0,
+        prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": INVENTORY_SYSTEM_PROMPT},
+    )
+    prompt = f"Customer request (date: {date}):\n{request}\n\nCheck stock for all items and restock if needed."
+    result = agent.run(prompt)
+    return str(result)
+ 
  
 def quote_agent(request: str, date: str, inventory_summary: str) -> str:
-    """Generate a priced quote for the customer request."""
+    """
+    Worker agent: generate an itemised, discount-aware price quote.
+ 
+    Args:
+        request:           The raw customer request text.
+        date:              The request date in YYYY-MM-DD format.
+        inventory_summary: JSON output from the inventory_agent.
+ 
+    Returns:
+        JSON string containing line items, discount rate, and total amount.
+    """
+    agent  = ToolCallingAgent(
+        tools=quote_tools,
+        model=llm_model,
+        max_steps=8,
+        verbosity_level=0,
+        prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": QUOTE_SYSTEM_PROMPT},
+    )
     prompt = (
         f"Customer request (date: {date}):\n{request}\n\n"
         f"Inventory status from Inventory Agent:\n{inventory_summary}\n\n"
         "Generate a full itemised quote with bulk discounts applied."
     )
-    return run_agent(QUOTE_SYSTEM_PROMPT, prompt, QUOTE_TOOLS, QUOTE_TOOL_MAP)
+    result = agent.run(prompt)
+    return str(result)
+ 
  
 def order_agent(request: str, date: str, quote_summary: str) -> str:
-    """Process the sale transactions from the approved quote."""
+    """
+    Worker agent: execute sale transactions from the approved quote.
+ 
+    Args:
+        request:       The raw customer request text.
+        date:          The request date in YYYY-MM-DD format.
+        quote_summary: JSON output from the quote_agent.
+ 
+    Returns:
+        JSON string summarising all transactions, revenue, and fulfillment status.
+    """
+    agent  = ToolCallingAgent(
+        tools=order_tools,
+        model=llm_model,
+        max_steps=10,
+        verbosity_level=0,
+        prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": ORDER_SYSTEM_PROMPT},
+    )
     prompt = (
         f"Customer request (date: {date}):\n{request}\n\n"
         f"Approved quote from Quote Agent:\n{quote_summary}\n\n"
         "Process all line items as sale transactions."
     )
-    return run_agent(ORDER_SYSTEM_PROMPT, prompt, ORDER_TOOLS, ORDER_TOOL_MAP)
+    result = agent.run(prompt)
+    return str(result)
+ 
  
 # ===========================================================================
-# ORCHESTRATOR  — main entry point
+# ORCHESTRATOR  — coordinates all worker agents
 # ===========================================================================
  
-def call_your_multi_agent_system(request: str) -> str:
+def handle_request(request: str) -> str:
     """
-    Orchestrate the full pipeline for one customer request.
-    Returns a customer-facing response string.
-    """
-    # Extract date from request string (format injected by run_test_scenarios)
-    date = datetime.now().strftime("%Y-%m-%d")
-    if "Date of request:" in request:
-        try:
-            date = request.split("Date of request:")[-1].strip().rstrip(")")
-        except Exception:
-            pass
+    Main pipeline entry point. Orchestrates the full Inventory → Quote → Order
+    pipeline for one customer request and returns a plain-English response.
  
+    The orchestrator uses a dedicated smolagents ToolCallingAgent (with no tools)
+    purely for LLM reasoning and synthesis, while the three worker agents handle
+    all tool interactions.
+ 
+    Args:
+        request: Raw customer request string (may include a date annotation).
+ 
+    Returns:
+        A professional, customer-facing response string.
+    """
+    date = _parse_date(request)
     print(f"  [Orchestrator] Running pipeline for date={date}")
  
     # Step 1: Inventory
     print("  [Inventory Agent] Checking & restocking...")
     inv_result = inventory_agent(request, date)
-    print(f"  [Inventory Agent] {inv_result[:120]}...")
+    print(f"  [Inventory Agent] Done.")
  
     # Step 2: Quote
     print("  [Quote Agent] Generating quote...")
     quote_result = quote_agent(request, date, inv_result)
-    print(f"  [Quote Agent] {quote_result[:120]}...")
+    print(f"  [Quote Agent] Done.")
  
     # Step 3: Order
     print("  [Order Agent] Processing transactions...")
     order_result = order_agent(request, date, quote_result)
-    print(f"  [Order Agent] {order_result[:120]}...")
+    print(f"  [Order Agent] Done.")
  
-    # Step 4: Orchestrator synthesises final response
+    # Step 4: Orchestrator synthesises a customer-facing response
+    orchestrator = ToolCallingAgent(
+        tools=[],
+        model=llm_model,
+        max_steps=3,
+        verbosity_level=0,
+        prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": (
+            "You are the Orchestrator for Munder Difflin Paper Company. "
+            "Synthesise the outputs of the three worker agents into a single, "
+            "professional, friendly customer-facing response that includes: "
+            "an itemised quote with discounts, delivery expectations, and total charged. "
+            "If items could not be fulfilled, explain why clearly. Respond in plain English."
+        )},
+    )
     synthesis_prompt = (
         f"Original customer request:\n{request}\n\n"
         f"Inventory Agent result:\n{inv_result}\n\n"
         f"Quote Agent result:\n{quote_result}\n\n"
         f"Order Agent result:\n{order_result}\n\n"
-        "Write a professional, friendly customer-facing response summarising the order, quote, and delivery."
+        "Write a professional, friendly customer-facing response."
     )
-    final_response = run_agent(ORCHESTRATOR_SYSTEM_PROMPT, synthesis_prompt, [], {})
-    return final_response
+    final_response = orchestrator.run(synthesis_prompt)
+    return str(final_response)
  
-
 # Run your test scenarios by writing them here. Make sure to keep track of them.
-
-
 
 def run_test_scenarios():
     
@@ -1050,16 +1040,9 @@ def run_test_scenarios():
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
 
+    # ── Initialize the multi-agent system ─────────────────────────────────
     print("Multi-agent system ready (Orchestrator + Inventory + Quote + Order agents).")
-
-
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
+    # ───────────────────────────────────────────────────────────────────────
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -1074,16 +1057,10 @@ def run_test_scenarios():
         # Process request
         request_with_date = f"{row['request']} (Date of request: {request_date})"
 
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
+        # ── Dispatch to multi-agent pipeline ──────────────────────────────
+        response = handle_request(request_with_date)
+        # ──────────────────────────────────────────────────────────────────
 
-        response = call_your_multi_agent_system(request_with_date)
-        
         # Update state
         report = generate_financial_report(request_date)
         current_cash = report["cash_balance"]

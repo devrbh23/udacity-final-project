@@ -1,32 +1,32 @@
 ================================================================
 MUNDER DIFFLIN PAPER COMPANY — MULTI-AGENT SYSTEM DESIGN NOTES
 ================================================================
-
+ 
 Author:       AI Consultant
 Date:         April 2025
 Framework:    OpenAI Python SDK (function calling / tool use)
 Model:        gpt-4o-mini via Vocareum OpenAI-compatible proxy
 Database:     SQLite via SQLAlchemy (provided starter code)
-
+ 
 ----------------------------------------------------------------
 1. SYSTEM OVERVIEW
 ----------------------------------------------------------------
-
+ 
 The Munder Difflin Multi-Agent System automates three core
 business workflows for a fictional paper supply company:
-
+ 
   1. Inventory management and restocking
   2. Quote generation with bulk discounts
   3. Order fulfillment and transaction recording
-
+ 
 The system processes incoming customer requests end-to-end,
 from checking stock through to recording revenue, using a
 pipeline of four coordinated AI agents.
-
+ 
 ----------------------------------------------------------------
 2. AGENT ARCHITECTURE (4 Agents)
 ----------------------------------------------------------------
-
+ 
 AGENT 1 — Inventory Agent
   Role    : Check stock levels; restock items that are low
   Tools   : check_inventory, get_full_inventory, restock_item
@@ -36,7 +36,7 @@ AGENT 1 — Inventory Agent
             the requested quantity, automatically places a
             restock order (min 500 units). Cash-aware: never
             orders more than the available cash balance allows.
-
+ 
 AGENT 2 — Quote Agent
   Role    : Generate an itemised, discount-aware price quote
   Tools   : lookup_past_quotes, get_item_price, get_catalogue
@@ -48,7 +48,7 @@ AGENT 2 — Quote Agent
               - Orders > $500  → 5% discount
               - Orders > $1000 → 10% discount
               - Orders > $5000 → 15% discount
-
+ 
 AGENT 3 — Order Agent
   Role    : Execute confirmed sale transactions
   Tools   : process_sale, get_cash_balance_tool,
@@ -59,7 +59,7 @@ AGENT 3 — Order Agent
             as a separate sale transaction (one DB call per
             item), skips items with insufficient stock and
             reports them clearly.
-
+ 
 AGENT 4 — Orchestrator
   Role    : Coordinate agents 1-3; synthesise customer response
   Tools   : None (reasoning and synthesis only)
@@ -69,16 +69,16 @@ AGENT 4 — Orchestrator
             forward at each step. Synthesises all results into
             a single professional response including quote
             details, fulfillment status, and delivery dates.
-
+ 
 ----------------------------------------------------------------
 3. AGENT COMMUNICATION PATTERN
 ----------------------------------------------------------------
-
+ 
 All agents communicate via structured text (JSON passed as
 prompt context). There is no shared memory or message bus.
-
+ 
 Pipeline flow per request:
-
+ 
   Customer Request
        │
        ▼
@@ -92,70 +92,70 @@ Pipeline flow per request:
        │
        ▼
   [Orchestrator] ──→ Customer Response (plain English)
-
+ 
 Each agent receives the outputs of all previous agents as
 context in its system/user prompt. This creates a chain where
 each agent has full awareness of prior decisions.
-
+ 
 ----------------------------------------------------------------
 4. TOOL DESIGN DECISIONS
 ----------------------------------------------------------------
-
+ 
 Tool implementations (_check_inventory, _restock_item, etc.)
 are thin Python wrappers around the database utility functions
 provided in the starter code. Each tool:
-
+ 
   - Returns a JSON string (not a Python object) so it can be
     passed back to the LLM as a tool result
   - Validates constraints before committing (e.g. stock check
     before processing a sale, cash check before restocking)
   - Handles errors gracefully and returns informative error
     messages in the JSON response
-
+ 
 The _get_item_price tool includes fuzzy matching: if the LLM
 passes a description like "heavy cardstock" instead of the
 exact catalogue name "250 gsm Cardstock", the tool finds the
 closest match so quotes still succeed.
-
+ 
 ----------------------------------------------------------------
 5. THE run_agent() FUNCTION
 ----------------------------------------------------------------
-
+ 
 All four agents share a single reusable run_agent() function
 that implements the standard OpenAI tool-use loop:
-
+ 
   1. Send system prompt + user message to the LLM
   2. If the response contains tool_calls, execute each one
   3. Append tool results to the message history
   4. Send updated messages back to the LLM
   5. Repeat until LLM produces a final text response (no tools)
   6. Return the final text
-
+ 
 Max turns = 6 per agent (prevents infinite loops).
-
+ 
 ----------------------------------------------------------------
 6. FRAMEWORK CHOICE RATIONALE
 ----------------------------------------------------------------
-
+ 
 The requirements.txt provided with the project lists only:
   pandas, openai, SQLAlchemy, python-dotenv, typing
-
+ 
 Since no agent orchestration framework (smolagents, pydantic-ai,
 npcsh) was included, the system was built using the OpenAI SDK
 directly with function calling (tool use). This is the most
 portable approach and requires zero additional dependencies
 beyond what was already specified.
-
+ 
 ----------------------------------------------------------------
 7. TEST RUN RESULTS SUMMARY
 ----------------------------------------------------------------
-
+ 
 Test period    : 2025-04-01 to 2025-04-17
 Total requests : 20
 Starting cash  : $44,909.70
 Ending cash    : $39,527.30
 Revenue earned : ~$5,382.40
-
+ 
 Key observations:
   - Large bulk orders (Requests 15, 20) triggered 15% discounts
   - Restocking was triggered automatically on ~14 of 20 requests
@@ -163,11 +163,11 @@ Key observations:
     fell after the customer's required date
   - The system correctly declined items not in the catalogue
     (e.g. party streamers, balloons, washi tape)
-
+ 
 ----------------------------------------------------------------
 8. FILES SUBMITTED
 ----------------------------------------------------------------
-
+ 
   project_starter.py      — Complete multi-agent implementation
   workflow_diagram.svg    — Agent architecture and data flow
   design_notes.txt        — This file
@@ -175,20 +175,77 @@ Key observations:
   quotes.csv              — Historical quote reference data
   quote_requests.csv      — Full quote request history
   quote_requests_sample.csv — Test scenario inputs
-
+ 
 ----------------------------------------------------------------
 9. HOW TO RUN
 ----------------------------------------------------------------
-
+ 
   1. Create a .env file with:
        UDACITY_OPENAI_API_KEY=your_key_here
-
+ 
   2. Install dependencies:
        pip install -r requirements.txt
-
+ 
   3. Run:
        python project_starter.py
-
+ 
   Output: test_results.csv + console logs for all 20 requests
-
+ 
+================================================================
+ 
+----------------------------------------------------------------
+10. FUTURE IMPROVEMENT SUGGESTIONS
+----------------------------------------------------------------
+ 
+IMPROVEMENT 1 — Persistent Agent Memory with Quote Embeddings
+--------------------------------------------------------------
+Currently the quote_agent searches historical quotes using simple
+keyword matching via search_quote_history(). A more powerful
+approach would be to embed each historical quote as a vector
+(using OpenAI's text-embedding-3-small model) and store them in
+a vector database (e.g. ChromaDB or pgvector). When a new
+customer request arrives, the quote_agent would embed the request
+and retrieve the top-K most semantically similar past quotes —
+not just keyword matches. This would improve pricing accuracy for
+complex or unusual requests where keyword overlap is low (e.g.
+a request for "biodegradable event supplies" would find quotes
+for "eco paper plates" even without exact keyword overlap).
+ 
+Implementation steps:
+  a) Add an embedding step to init_database() that vectorises
+     all rows in the quotes table on startup.
+  b) Create a new smolagents tool SearchSimilarQuotesTool that
+     calls a vector store's similarity_search() method.
+  c) Replace the current lookup_past_quotes tool in the quote
+     agent's tool list with this new semantic search tool.
+ 
+IMPROVEMENT 2 — Retry Logic and Circuit Breaker for Supplier Orders
+--------------------------------------------------------------------
+The current restock_item tool makes a single attempt to record a
+stock order. In production, two failure modes are common: (a) the
+LLM API call itself times out or returns a rate-limit error, and
+(b) the database transaction fails due to a connection issue.
+Neither case is currently handled — the agent simply fails
+silently or raises an unhandled exception.
+ 
+A robust implementation would add:
+ 
+  a) Retry logic in the RestockItemTool.forward() method using
+     exponential backoff (e.g. tenacity library) — retry up to 3
+     times on transient DB errors before surfacing a failure.
+ 
+  b) A circuit breaker pattern in the ToolCallingAgent wrapper:
+     if the same tool raises errors on 3 consecutive calls within
+     one agent run, mark it as "unavailable" for the remainder of
+     that run and have the agent fall back gracefully (e.g. log
+     the restock intent without committing a transaction).
+ 
+  c) Idempotency keys on create_transaction() calls so that if a
+     network retry causes a duplicate call, the DB layer detects
+     and deduplicates the transaction rather than recording it
+     twice (which would double-debit cash).
+ 
+These two improvements together would move the system from
+prototype-grade to production-grade reliability.
+ 
 ================================================================
