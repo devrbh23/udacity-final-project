@@ -598,6 +598,8 @@ dotenv.load_dotenv()
 api_key  = os.getenv("UDACITY_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 base_url = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
 
+
+ 
 llm_model = OpenAIServerModel(
     model_id="gpt-4o-mini",
     api_base=base_url,
@@ -842,12 +844,34 @@ class GetSupplierLeadTimeTool(Tool):
         return json.dumps({"order_date": order_date, "quantity": quantity, "estimated_delivery": delivery})
  
  
+ 
+ 
+class GenerateFinancialReportTool(Tool):
+    """smolagents tool: generate a full financial snapshot of the business."""
+    name        = "generate_financial_report_tool"
+    description = (
+        "Generate a full financial report for Munder Difflin as of a given date. "
+        "Returns JSON with cash_balance, inventory_value, total_revenue, "
+        "total_costs, and net_profit. Use after completing all transactions "
+        "to summarise the financial impact of an order."
+    )
+    inputs      = {
+        "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+    }
+    output_type = "string"
+ 
+    def forward(self, as_of_date: str) -> str:
+        """Return a full financial snapshot as of the given date."""
+        report = generate_financial_report(as_of_date)
+        return json.dumps({k: round(v, 2) if isinstance(v, float) else v
+                           for k, v in report.items()})
+ 
 # ===========================================================================
 # INSTANTIATE TOOL OBJECTS
 # ===========================================================================
 inventory_tools = [CheckInventoryTool(), GetFullInventoryTool(), RestockItemTool()]
 quote_tools     = [LookupPastQuotesTool(), GetItemPriceTool(), GetCatalogueTool()]
-order_tools     = [ProcessSaleTool(), GetCashBalanceTool(), GetSupplierLeadTimeTool()]
+order_tools     = [ProcessSaleTool(), GetCashBalanceTool(), GetSupplierLeadTimeTool(), GenerateFinancialReportTool()]
  
  
 # ===========================================================================
@@ -864,9 +888,16 @@ INVENTORY_SYSTEM_PROMPT = (
  
 QUOTE_SYSTEM_PROMPT = (
     "You are the Quote Agent for Munder Difflin Paper Company. "
-    "Search past quotes for context, look up unit prices, and produce an itemised quote. "
-    "Apply bulk discounts: >$500 → 5%, >$1000 → 10%, >$5000 → 15%. "
-    "Return JSON: {line_items, discount_rate, total_amount, quote_explanation}."
+    "Search past quotes for pricing context, look up unit prices, and produce an itemised quote. "
+    "You MUST apply bulk discounts using EXACTLY these thresholds — no exceptions: "
+    "  * Sum of all line items > $5000 → discount_rate = 0.15 (15 percent) "
+    "  * Sum of all line items > $1000 → discount_rate = 0.10 (10 percent) "
+    "  * Sum of all line items > $500  → discount_rate = 0.05 (5 percent) "
+    "  * Sum of all line items <= $500 → discount_rate = 0.00 (no discount) "
+    "Always compute raw_total first, then apply discount_rate to get total_amount. "
+    "NEVER apply a discount if the raw_total is $500 or below. "
+    "Return JSON with these exact keys: "
+    "{line_items, raw_total, discount_rate, total_amount, quote_explanation}."
 )
  
 ORDER_SYSTEM_PROMPT = (
@@ -1017,6 +1048,7 @@ def handle_request(request: str) -> str:
     final_response = orchestrator.run(synthesis_prompt)
     return str(final_response)
  
+
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
