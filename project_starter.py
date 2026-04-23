@@ -598,8 +598,6 @@ dotenv.load_dotenv()
 api_key  = os.getenv("UDACITY_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 base_url = os.getenv("OPENAI_BASE_URL", "https://openai.vocareum.com/v1")
 
-
- 
 llm_model = OpenAIServerModel(
     model_id="gpt-4o-mini",
     api_base=base_url,
@@ -908,97 +906,109 @@ ORDER_SYSTEM_PROMPT = (
 )
  
  
-def inventory_agent(request: str, date: str) -> str:
-    """
-    Worker agent: check and replenish stock for all items in the request.
+# ===========================================================================
+# WORKER AGENT FACTORY
+# Each worker is created fresh per request to avoid state leakage between
+# requests. Agents are proper smolagents ToolCallingAgent instances.
+# ===========================================================================
  
-    Args:
-        request: The raw customer request text.
-        date:    The request date in YYYY-MM-DD format.
- 
-    Returns:
-        JSON string summarising items checked and any restock orders placed.
+def _make_inventory_agent() -> ToolCallingAgent:
     """
-    agent  = ToolCallingAgent(
+    Factory: create a fresh ToolCallingAgent for inventory management.
+ 
+    Returns a smolagents ToolCallingAgent equipped with CheckInventoryTool,
+    GetFullInventoryTool, and RestockItemTool. A fresh instance is created
+    per request to avoid memory/state leakage between requests.
+    """
+    return ToolCallingAgent(
         tools=inventory_tools,
         model=llm_model,
-        max_steps=8,
+        name="inventory_agent",
+        description=(
+            "Checks current stock levels for all items in a customer request "
+            "and automatically restocks any item below 100 units or below the "
+            "requested quantity. Returns a JSON summary of items checked and "
+            "any restock orders placed, including estimated delivery dates."
+        ),
+        max_steps=15,
         verbosity_level=0,
         prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": INVENTORY_SYSTEM_PROMPT},
     )
-    prompt = f"Customer request (date: {date}):\n{request}\n\nCheck stock for all items and restock if needed."
-    result = agent.run(prompt)
-    return str(result)
  
  
-def quote_agent(request: str, date: str, inventory_summary: str) -> str:
+def _make_quote_agent() -> ToolCallingAgent:
     """
-    Worker agent: generate an itemised, discount-aware price quote.
+    Factory: create a fresh ToolCallingAgent for quote generation.
  
-    Args:
-        request:           The raw customer request text.
-        date:              The request date in YYYY-MM-DD format.
-        inventory_summary: JSON output from the inventory_agent.
- 
-    Returns:
-        JSON string containing line items, discount rate, and total amount.
+    Returns a smolagents ToolCallingAgent equipped with LookupPastQuotesTool,
+    GetItemPriceTool, and GetCatalogueTool. Applies tiered bulk discounts.
     """
-    agent  = ToolCallingAgent(
+    return ToolCallingAgent(
         tools=quote_tools,
         model=llm_model,
-        max_steps=8,
+        name="quote_agent",
+        description=(
+            "Generates a fully itemised, discount-aware price quote. Searches "
+            "historical quotes for context, maps descriptions to catalogue names, "
+            "and applies bulk discounts: >$500=5%, >$1000=10%, >$5000=15%."
+        ),
+        max_steps=15,
         verbosity_level=0,
         prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": QUOTE_SYSTEM_PROMPT},
     )
-    prompt = (
-        f"Customer request (date: {date}):\n{request}\n\n"
-        f"Inventory status from Inventory Agent:\n{inventory_summary}\n\n"
-        "Generate a full itemised quote with bulk discounts applied."
-    )
-    result = agent.run(prompt)
-    return str(result)
  
  
-def order_agent(request: str, date: str, quote_summary: str) -> str:
+def _make_order_agent() -> ToolCallingAgent:
     """
-    Worker agent: execute sale transactions from the approved quote.
+    Factory: create a fresh ToolCallingAgent for order fulfillment.
  
-    Args:
-        request:       The raw customer request text.
-        date:          The request date in YYYY-MM-DD format.
-        quote_summary: JSON output from the quote_agent.
- 
-    Returns:
-        JSON string summarising all transactions, revenue, and fulfillment status.
+    Returns a smolagents ToolCallingAgent equipped with ProcessSaleTool,
+    GetCashBalanceTool, GetSupplierLeadTimeTool, and GenerateFinancialReportTool.
+    Verifies cash and stock before committing each transaction.
     """
-    agent  = ToolCallingAgent(
+    return ToolCallingAgent(
         tools=order_tools,
         model=llm_model,
-        max_steps=10,
+        name="order_agent",
+        description=(
+            "Executes confirmed sale transactions from an approved quote. "
+            "Verifies cash availability, processes each line item as a separate "
+            "sale transaction, and reports any items that could not be fulfilled."
+        ),
+        max_steps=20,
         verbosity_level=0,
         prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": ORDER_SYSTEM_PROMPT},
     )
-    prompt = (
-        f"Customer request (date: {date}):\n{request}\n\n"
-        f"Approved quote from Quote Agent:\n{quote_summary}\n\n"
-        "Process all line items as sale transactions."
-    )
-    result = agent.run(prompt)
-    return str(result)
  
  
 # ===========================================================================
-# ORCHESTRATOR  — coordinates all worker agents
+# ORCHESTRATOR — coordinates worker agents sequentially
+# The orchestrator is a smolagents ToolCallingAgent that delegates each stage
+# of the pipeline to a specialist worker agent, passing context forward at
+# each step. Worker agents are instantiated fresh for each request.
 # ===========================================================================
+ 
+ORCHESTRATOR_SYSTEM_PROMPT = (
+    "You are the Orchestrator for Munder Difflin Paper Company. "
+    "You receive pre-processed outputs from three specialist agents "
+    "(inventory_agent, quote_agent, order_agent) and synthesise them into "
+    "a single professional, friendly customer-facing response. "
+    "Your response must include: an itemised quote with discounts applied, "
+    "the delivery date, and the total amount charged. "
+    "If any items could not be fulfilled, explain why clearly. "
+    "Respond in plain English only — no JSON."
+)
+ 
  
 def handle_request(request: str) -> str:
     """
-    Main pipeline entry point. Orchestrates the full Inventory → Quote → Order
-    pipeline for one customer request and returns a plain-English response.
+    Main pipeline entry point. The Orchestrator coordinates three smolagents
+    ToolCallingAgent worker agents in sequence — inventory, quote, and order —
+    passing each agent's output as context to the next. The Orchestrator then
+    synthesises all results into a customer-facing response.
  
-    The orchestrator uses a dedicated smolagents ToolCallingAgent (with no tools)
-    purely for LLM reasoning and synthesis, while the three worker agents handle
-    all tool interactions.
+    Worker agents are created fresh per request via factory functions to avoid
+    state leakage between the 20 test scenarios.
  
     Args:
         request: Raw customer request string (may include a date annotation).
@@ -1007,39 +1017,60 @@ def handle_request(request: str) -> str:
         A professional, customer-facing response string.
     """
     date = _parse_date(request)
-    print(f"  [Orchestrator] Running pipeline for date={date}")
+    print(f"  [Orchestrator] Coordinating pipeline for date={date}")
  
-    # Step 1: Inventory
+    # Step 1: Inventory Agent checks and restocks stock
     print("  [Inventory Agent] Checking & restocking...")
-    inv_result = inventory_agent(request, date)
-    print(f"  [Inventory Agent] Done.")
+    inv_agent  = _make_inventory_agent()
+    inv_prompt = (
+        f"Date: {date}\n"
+        f"Customer request: {request}\n\n"
+        "Check stock for every item mentioned. Restock any item below 100 units "
+        "or below the requested quantity (order at least 500 units). "
+        "Return a JSON summary of items checked and any restock orders placed."
+    )
+    inv_result = str(inv_agent.run(inv_prompt))
+    print("  [Inventory Agent] Done.")
  
-    # Step 2: Quote
+    # Step 2: Quote Agent generates an itemised, discounted quote
     print("  [Quote Agent] Generating quote...")
-    quote_result = quote_agent(request, date, inv_result)
-    print(f"  [Quote Agent] Done.")
+    q_agent  = _make_quote_agent()
+    q_prompt = (
+        f"Date: {date}\n"
+        f"Customer request: {request}\n\n"
+        f"Inventory status (from Inventory Agent):\n{inv_result}\n\n"
+        "Generate a full itemised quote. Apply the correct bulk discount tier. "
+        "Compute raw_total first, then apply discount_rate to get total_amount."
+    )
+    quote_result = str(q_agent.run(q_prompt))
+    print("  [Quote Agent] Done.")
  
-    # Step 3: Order
+    # Step 3: Order Agent processes confirmed transactions
     print("  [Order Agent] Processing transactions...")
-    order_result = order_agent(request, date, quote_result)
-    print(f"  [Order Agent] Done.")
+    o_agent  = _make_order_agent()
+    o_prompt = (
+        f"Date: {date}\n"
+        f"Customer request: {request}\n\n"
+        f"Approved quote (from Quote Agent):\n{quote_result}\n\n"
+        "Process each line item as a sale transaction. Call process_sale once "
+        "per item. Skip and report any items with insufficient stock."
+    )
+    order_result = str(o_agent.run(o_prompt))
+    print("  [Order Agent] Done.")
  
-    # Step 4: Orchestrator synthesises a customer-facing response
+    # Step 4: Orchestrator synthesises the final customer-facing response
+    print("  [Orchestrator] Synthesising response...")
     orchestrator = ToolCallingAgent(
         tools=[],
         model=llm_model,
-        max_steps=3,
+        name="orchestrator",
+        description="Synthesises worker agent outputs into a customer response.",
+        max_steps=5,
         verbosity_level=0,
-        prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": (
-            "You are the Orchestrator for Munder Difflin Paper Company. "
-            "Synthesise the outputs of the three worker agents into a single, "
-            "professional, friendly customer-facing response that includes: "
-            "an itemised quote with discounts, delivery expectations, and total charged. "
-            "If items could not be fulfilled, explain why clearly. Respond in plain English."
-        )},
+        prompt_templates={**EMPTY_PROMPT_TEMPLATES, "system_prompt": ORCHESTRATOR_SYSTEM_PROMPT},
     )
     synthesis_prompt = (
-        f"Original customer request:\n{request}\n\n"
+        f"Customer request: {request}\n\n"
         f"Inventory Agent result:\n{inv_result}\n\n"
         f"Quote Agent result:\n{quote_result}\n\n"
         f"Order Agent result:\n{order_result}\n\n"
@@ -1047,6 +1078,7 @@ def handle_request(request: str) -> str:
     )
     final_response = orchestrator.run(synthesis_prompt)
     return str(final_response)
+ 
  
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
